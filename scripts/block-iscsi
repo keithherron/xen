@@ -1,0 +1,87 @@
+#!/bin/bash
+# block-iscsi  -  2009 Keith Herron <keith@backdrift.org>
+#
+# multipath enabled block-iscsi xen block script.
+#
+# Note: This script depends on a block-iscsi.conf file
+#       located in the same directory.  This file contains
+#       an array of available iSCSI target IPs
+#
+ 
+dir=$(dirname "$0")
+. "$dir/block-common.sh"
+. "$dir/block-iscsi.conf"
+ 
+# Log which mode we are in
+logger -t block-iscsi "*** Beginning device $command ***"
+ 
+# Fetch the iqn we specify in the domu config file
+#
+IQN=$(xenstore_read "$XENBUS_PATH/params")
+logger -t block-iscsi "IQN: ${IQN}"
+ 
+# We define portal ip in order to support new luns which don't yet have
+# /var/lib/iscsi/node entrys yet, not dynamic but avoids manual discovery 
+#
+for PORTAL in ${PORTALS[@]}; do
+  logger -t block-iscsi `iscsiadm -m discovery -t st -p $PORTAL`
+done
+ 
+# Using the iscsi node directory we can determine the ip and port of 
+# our iscsi target on a lun by lun basis
+#
+  IP=`ls /var/lib/iscsi/nodes/${IQN} | cut -d , -f 1`
+PORT=`ls /var/lib/iscsi/nodes/${IQN} | cut -d , -f 2`
+ 
+logger -t block-iscsi "TARGET: ${IP}:${PORT}"
+ 
+# This is called by each command to determine which multipath map to use
+#
+function get_mpath_map {
+   # Re-run multipath to ensure that maps are up to date
+   #
+   multipath
+   sleep 2
+ 
+   # Now we determine which /dev/sd* device belongs to the iqn
+   #
+   SCSI_DEV="/dev/`basename \`/usr/bin/readlink /dev/disk/by-path/ip-${IP}:${PORT}-iscsi-${IQN}-lun-0\``"
+   logger -t block-iscsi "scsi device: ${SCSI_DEV}"
+ 
+   # And using the /dev/sd* device we can determine its corresponding multipath entry
+   #
+   MPATH_MAP="/dev/mapper/`multipath -ll ${SCSI_DEV} | head -1 | awk '{ print $1}'`"
+   logger -t block-iscsi "mpath device: ${MPATH_MAP}"
+}
+ 
+case $command in
+   add)
+      # Login to the target
+      logger -t block-iscsi "logging in to ${IQN} on ${IP}:${PORT}"
+      sleep 5
+      #FIXME needs more advanced race condition logic
+      iscsiadm -m node -T ${IQN} -p ${IP}:${PORT} --login | logger -t block-iscsi
+      sleep 5
+      #FIXME needs more advanced race condition logic
+      get_mpath_map
+ 
+      if [ -a ${MPATH_MAP} ]; then
+         logger -t block-iscsi "${command}ing device: ${MPATH_MAP}"
+         write_dev ${MPATH_MAP}
+      fi
+   ;;
+ 
+   remove)
+      get_mpath_map
+      if [ -a ${MPATH_MAP} ]; then
+         logger -t block-iscsi "flushing buffers on ${MPATH_MAP}"
+         blockdev --flushbufs ${MPATH_MAP}
+         logger -t block-iscsi "attempting logout of ${IQN} on ${IP}:${PORT}"
+         iscsiadm -m node -T ${IQN} -p ${IP}:${PORT} --logout | logger -t block-iscsi
+         sleep  10
+         #FIXME needs more advanced race condition logic
+      fi
+      sleep 5
+      #FIXME needs more advanced race condition logic
+   ;;
+esac
